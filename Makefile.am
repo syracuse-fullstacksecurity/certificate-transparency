@@ -351,6 +351,7 @@ cpp_client_ct_LDADD = \
 	cpp/libcore.a \
 	$(evhtp_LIBS) \
 	$(json_c_LIBS) \
+	$(leveldb_LIBS) \
 	$(libevent_LIBS) \
 	$(sqlite3_LIBS) \
 	-lprotobuf
@@ -360,6 +361,7 @@ cpp_client_ct_SOURCES = \
 	cpp/client/ct.cc \
 	cpp/client/http_log_client.cc \
 	cpp/client/ssl_client.cc \
+	cpp/client/leveldb_db_client.cc \
 	cpp/proto/cert_serializer.cc \
 	cpp/proto/serializer.cc \
 	cpp/util/init.cc \

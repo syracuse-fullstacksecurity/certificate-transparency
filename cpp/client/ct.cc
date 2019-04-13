@@ -37,6 +37,24 @@
 #include "util/read_key.h"
 #include "util/util.h"
 
+#include "client/leveldb_db_client.h"
+#include <openssl/x509.h>
+
+struct entry_1 {
+ 	int key;
+	char *name;
+};
+static const struct entry_1 nids[7] = {
+	{NID_countryName, (char *)"countryName"},
+	{NID_stateOrProvinceName, (char *)"stateOrProvinceName"},
+	{NID_localityName, (char *)"localityName"},
+	{NID_organizationName, (char *)"organiationName"},
+	{NID_organizationalUnitName, (char *)"organizationalUnitName"},
+	{NID_commonName, (char *)"commonName"},
+	{NID_pkcs9_emailAddress, (char *)"emailAddress"},
+};
+
+
 DEFINE_string(ssl_client_trusted_cert_dir, "",
               "Trusted root certificates for the ssl client");
 DEFINE_string(ct_server_public_key, "",
@@ -141,6 +159,7 @@ using std::unique_ptr;
 using std::vector;
 using util::Status;
 using util::StatusOr;
+
 
 // SCTs presented to clients have to be encoded as a list.
 // Helper method for encoding a single SCT.
@@ -838,12 +857,14 @@ static void WriteCertificate(const std::string& cert, int entry,
   out << cert;
 }
 
-void GetEntries() {
+void GetEntries(leveldb::DB* db) {
   CHECK_NE(FLAGS_ct_server, "");
   HTTPLogClient client(FLAGS_ct_server);
   const StatusOr<vector<AsyncLogClient::Entry>> entries(
       client.GetEntries(FLAGS_get_first, FLAGS_get_last));
   CHECK_EQ(entries.status(), ::util::OkStatus());
+
+  //cert_trans::LevelDB_client db("client.db");
 
   CHECK(!FLAGS_certificate_base.empty());
 
@@ -852,8 +873,50 @@ void GetEntries() {
            entry = entries.ValueOrDie().begin();
        entry != entries.ValueOrDie().end(); ++entry, ++e) {
     if (entry->leaf.timestamped_entry().entry_type() == ct::X509_ENTRY) {
+      // The certificate to keep
       WriteCertificate(entry->leaf.timestamped_entry().signed_entry().x509(),
                        e, 0, "x509");
+
+      // parse for domain name
+      string domainName;
+      string valueCert;
+      //string valueFetch = " ";
+      X509 *certX509;
+      const char* p = entry->leaf.timestamped_entry().signed_entry().x509().data();
+      const unsigned char* buf = (const unsigned char*)p;
+      certX509 = d2i_X509(NULL, &buf, (entry->leaf.timestamped_entry().signed_entry().x509()).length());
+      X509_NAME *nameCertX509 = NULL;
+      nameCertX509 = X509_get_subject_name(certX509);
+      int entryCount = X509_NAME_entry_count(nameCertX509);
+      ASN1_STRING *d = NULL;
+      int pos;
+	    for (int i = 0; i < 7; i++) {
+			  pos = X509_NAME_get_index_by_NID(nameCertX509, nids[i].key, pos);
+			  if (pos >=0 && pos <= entryCount) {
+				  d = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(nameCertX509, pos));
+				  //printf("%s = %s [%d]\n", nids[i].name, d->data, d->length);
+          if(i == 5){
+            //  find domainName = common_name
+            domainName = (char*)d->data;
+          }
+		    }
+	    }
+      valueCert = p; 
+      //PEM_write_X509(stdout, certX509);
+      printf("  key=%s\n", domainName.c_str());
+      printf("  value=%s\n", valueCert.c_str());
+      //db.InsertValue(domainName, valueCert);
+      //db.FetchValue(domainName, valueFetch);
+
+
+      //BIO *STDout = NULL;
+      //STDout = BIO_new_fp(stdout, BIO_NOCLOSE);
+      //X509_print_ex(STDout, certX509, 0, 0);
+      //ss>>temp;
+
+      
+      db->Put(leveldb::WriteOptions(), domainName, valueCert);
+
       const ct::X509ChainEntry& x509chain = entry->entry.x509_entry();
       for (int n = 0; n < x509chain.certificate_chain_size(); ++n)
         WriteCertificate(x509chain.certificate_chain(n), e, n + 1, "x509");
@@ -871,6 +934,7 @@ void GetEntries() {
                          "x509");
     }
   }
+  //system("openssl x509 -inform der -in test100.0.x509.der -text -noout");
 }
 
 int GetRoots() {
@@ -908,7 +972,9 @@ int GetSTH() {
   const LogVerifier::LogVerifyResult result =
       verifier->VerifySignedTreeHead(sth.ValueOrDie(), 0, latest);
 
+  // to be parsed
   LOG(INFO) << "STH is " << sth.ValueOrDie().DebugString();
+  std::cout << sth.ValueOrDie().timestamp() << std::endl;
 
   if (result != LogVerifier::VERIFY_OK) {
     if (result == LogVerifier::INVALID_TIMESTAMP)
@@ -924,6 +990,7 @@ int GetSTH() {
   string sth_str;
   CHECK(sth.ValueOrDie().SerializeToString(&sth_str));
   WriteFile(FLAGS_ct_server_response_out, sth_str, "STH");
+  //WriteFile(FLAGS_ct_server_response_out, sth.ValueOrDie().DebugString(), "STH_readable");
 
   return 0;
 }
@@ -951,6 +1018,13 @@ int main(int argc, char** argv) {
 
   const string cmd(argv[1]);
 
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::DB* db;
+  leveldb::Status status(leveldb::DB::Open(options, "client.db", &db));
+  CHECK(status.ok()) << status.ToString();
+
+
   int ret = 0;
   if (cmd == "connect") {
     bool want_fail = FLAGS_ssl_client_expect_handshake_failure;
@@ -977,7 +1051,7 @@ int main(int argc, char** argv) {
   } else if (cmd == "wrap_embedded") {
     WrapEmbedded();
   } else if (cmd == "get_entries") {
-    GetEntries();
+    GetEntries(db);
   } else if (cmd == "get_roots") {
     ret = GetRoots();
   } else if (cmd == "sth") {
@@ -987,5 +1061,15 @@ int main(int argc, char** argv) {
     ret = 1;
   }
 
+  // test for Get
+  /*
+  string valueGet = "";
+  leveldb::Status s = db->Get(leveldb::ReadOptions(), "www.stickermule.com", &valueGet);
+  if(s.ok() && valueGet != ""){
+    std::cout<<"The value for key=www.stickermule.com is:"<<std::endl;
+    std::cout<<valueGet<<std::endl;
+  }
+  */
+  
   return ret;
 }
